@@ -274,6 +274,205 @@ pub fn decode_section(data: &[u8], section: &Section) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Encode bytes as literal records in the WBI LZ77 token grammar.
+///
+/// This uses the documented `0x0f` literal token, a zero reserved byte,
+/// a little-endian u16 length, and raw bytes. It is a portable host encoding,
+/// not a reproduction of Sony's CMPR hardware output.
+pub fn encode_literal_section(bytes: &[u8]) -> Result<Vec<u8>> {
+    if bytes.is_empty() {
+        return Err(Error::Invalid("empty WBI section"));
+    }
+    let blocks = bytes.len().div_ceil(usize::from(u16::MAX));
+    let capacity = bytes
+        .len()
+        .checked_add(blocks.checked_mul(4).ok_or(Error::Invalid("WBI literal size overflow"))?)
+        .ok_or(Error::Invalid("WBI literal size overflow"))?;
+    let mut out = Vec::with_capacity(capacity);
+    for chunk in bytes.chunks(usize::from(u16::MAX)) {
+        out.push(0x0f);
+        out.push(0); // reserved byte consumed by Sony/fwtool readers
+        out.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+        out.extend_from_slice(chunk);
+    }
+    Ok(out)
+}
+
+fn sector_round(size: usize, sector: usize) -> Result<usize> {
+    if sector == 0 || !sector.is_power_of_two() {
+        return Err(Error::Invalid("invalid WBI sector size"));
+    }
+    size.checked_add(sector - 1)
+        .map(|n| n & !(sector - 1))
+        .ok_or(Error::Invalid("WBI sector extent overflow"))
+}
+
+fn wbi_xor_checksum(bytes: &[u8]) -> u32 {
+    bytes.chunks_exact(4).fold(0x0f0f_0f0f, |sum, word| {
+        sum ^ u32::from_le_bytes([word[0], word[1], word[2], word[3]])
+    })
+}
+
+/// Replace one existing WBI section with same-length decoded bytes.
+///
+/// The target section is re-encoded using literal `0x0f` tokens, then its
+/// stored extent, source checksum (when enabled), and metadata XOR are
+/// recalculated. Other section streams and descriptors are copied verbatim.
+/// The resulting buffer is a host-only WBI candidate accepted by this
+/// crate's parser; it is **not** guaranteed to match Sony's CMPR hardware
+/// bytes or to be accepted by the immutable EXBL/WBI boot consumer.
+///
+/// This function never opens a device, writes NAND, or activates an image.
+pub fn replace_section_contents(
+    original: &[u8],
+    section_index: usize,
+    replacement: &[u8],
+) -> Result<Vec<u8>> {
+    let image = parse(original)?;
+    if image.header.flags & 0x09 != 0x09 {
+        return Err(Error::Invalid("WBI image is not in the supported compressed LZ77 mode"));
+    }
+    let target = image.sections.get(section_index).ok_or(Error::Invalid("WBI section index"))?;
+    if replacement.len() != target.expanded_size {
+        return Err(Error::Invalid("replacement section size must remain unchanged"));
+    }
+
+    let literal = encode_literal_section(replacement)?;
+    let sector =
+        usize::try_from(image.header.sector_size).map_err(|_| Error::Invalid("WBI sector size"))?;
+    let new_target_extent = sector_round(literal.len(), sector)?;
+    let old_table_start = image
+        .data_offset
+        .checked_add(image.header.compressed_size as usize)
+        .ok_or(Error::Invalid("WBI table offset overflow"))?;
+    let table_len = image
+        .sections
+        .len()
+        .checked_mul(SECTION_BYTES)
+        .ok_or(Error::Invalid("WBI table size overflow"))?;
+    let old_table_end = old_table_start
+        .checked_add(table_len)
+        .ok_or(Error::Invalid("WBI table extent overflow"))?;
+    let old_table = original
+        .get(old_table_start..old_table_end)
+        .ok_or(Error::OutOfBounds { context: "WBI section table for replacement" })?;
+
+    let mut data_region = Vec::new();
+    let mut table = Vec::with_capacity(table_len);
+    let mut stored_total = 0usize;
+
+    for section in &image.sections {
+        let is_target = section.index == section_index;
+        let stored = if is_target {
+            literal.as_slice()
+        } else {
+            original
+                .get(section.compressed_offset..section.compressed_offset + section.compressed_size)
+                .ok_or(Error::OutOfBounds { context: "WBI unchanged section stream" })?
+        };
+        let stored_extent = if is_target { new_target_extent } else { section.compressed_size };
+        data_region.extend_from_slice(stored);
+        data_region.resize(
+            data_region
+                .len()
+                .checked_add(stored_extent - stored.len())
+                .ok_or(Error::Invalid("WBI section padding overflow"))?,
+            0,
+        );
+        stored_total = stored_total
+            .checked_add(stored_extent)
+            .ok_or(Error::Invalid("WBI stored extent overflow"))?;
+
+        if is_target {
+            let checksum = if image.header.flags & 0x04 != 0 {
+                wbi_xor_checksum(replacement)
+            } else {
+                // Sony's writer skips source-data checksum recalculation when
+                // WBI_CKSUM is clear; preserve the original descriptor value.
+                section.checksum
+            };
+            let words = [
+                section.physical_address,
+                u32::try_from(new_target_extent)
+                    .map_err(|_| Error::Invalid("WBI section extent exceeds ARM32"))?,
+                checksum,
+                0,
+                u32::try_from(section.expanded_size)
+                    .map_err(|_| Error::Invalid("WBI expanded size exceeds ARM32"))?,
+                section.virtual_address,
+                section.padding,
+            ];
+            let metadata = words.iter().fold(0x0f0f_0f0f, |sum, word| sum ^ word);
+            for word in words.into_iter().chain([metadata]) {
+                table.extend_from_slice(&word.to_le_bytes());
+            }
+        } else {
+            let descriptor_offset = section.index * SECTION_BYTES;
+            table.extend_from_slice(
+                old_table
+                    .get(descriptor_offset..descriptor_offset + SECTION_BYTES)
+                    .ok_or(Error::OutOfBounds { context: "WBI unchanged descriptor" })?,
+            );
+        }
+    }
+
+    let output_data_offset = image.data_offset;
+    let table_start = output_data_offset
+        .checked_add(stored_total)
+        .ok_or(Error::Invalid("WBI output table offset overflow"))?;
+    let unrounded_end =
+        table_start.checked_add(table.len()).ok_or(Error::Invalid("WBI output extent overflow"))?;
+    let output_len = sector_round(unrounded_end, sector)?;
+
+    // Keep the complete original prefix (header sector and any observed
+    // leading erased sectors) byte-for-byte, but discard part5 storage slack.
+    let mut output = Vec::with_capacity(output_len);
+    output.extend_from_slice(
+        original
+            .get(..output_data_offset)
+            .ok_or(Error::OutOfBounds { context: "WBI header/data prefix" })?,
+    );
+    output.extend_from_slice(&data_region);
+    output.extend_from_slice(&table);
+    output.resize(output_len, 0);
+    let stored_total_u32 =
+        u32::try_from(stored_total).map_err(|_| Error::Invalid("WBI stored size exceeds ARM32"))?;
+    output[24..28].copy_from_slice(&stored_total_u32.to_le_bytes());
+
+    // Prove the rebuilt candidate parses and that the patched section decodes
+    // to exactly the supplied bytes. This remains a host parser check only.
+    let rebuilt = parse(&output)?;
+    let rebuilt_target = rebuilt
+        .sections
+        .get(section_index)
+        .ok_or(Error::Invalid("rebuilt WBI target section missing"))?;
+    if decode_section(&output, rebuilt_target)? != replacement {
+        return Err(Error::Invalid("rebuilt WBI literal stream did not round-trip"));
+    }
+    Ok(output)
+}
+
+/// Flip a byte in one decoded section and rebuild a detached WBI candidate.
+///
+/// `mask` must be non-zero. This convenience function is useful for offline
+/// fault injection and byte-level experiments; it performs no device write.
+pub fn flip_section_byte(
+    original: &[u8],
+    section_index: usize,
+    offset: usize,
+    mask: u8,
+) -> Result<Vec<u8>> {
+    if mask == 0 {
+        return Err(Error::Invalid("WBI byte-flip mask is zero"));
+    }
+    let image = parse(original)?;
+    let section = image.sections.get(section_index).ok_or(Error::Invalid("WBI section index"))?;
+    let mut decoded = decode_section(original, section)?;
+    let byte = decoded.get_mut(offset).ok_or(Error::Invalid("WBI byte-flip offset"))?;
+    *byte ^= mask;
+    replace_section_contents(original, section_index, &decoded)
+}
+
 /// Hash the uncompressed data of one memory section for comparisons.
 pub fn digest_section(data: &[u8], section: &Section) -> Result<[u8; 32]> {
     let decoded = decode_section(data, section)?;
@@ -357,7 +556,10 @@ mod tests {
     use super::*;
 
     fn fixture(raw: &[u8], address: u32) -> Vec<u8> {
-        assert!(!raw.is_empty() && raw.len() <= 65535);
+        assert!(!raw.is_empty());
+        let encoded = encode_literal_section(raw).unwrap();
+        let stored_size = sector_round(encoded.len(), 512).unwrap();
+        let table_start = 512 + stored_size;
         let mut out = vec![0; 512];
         out[0..4].copy_from_slice(b"WBI1");
         for (off, value) in [
@@ -366,26 +568,24 @@ mod tests {
             (12, 0x8004_96e0),
             (16, VERSION),
             (20, 512),
-            (24, raw.len() as u32 + 4),
+            (24, stored_size as u32),
             (40, raw.len() as u32),
         ] {
             out[off..off + 4].copy_from_slice(&value.to_le_bytes());
         }
-        out.push(0x0f);
-        out.push(0);
-        out.extend_from_slice(&(raw.len() as u16).to_le_bytes());
-        out.extend_from_slice(raw);
+        out.extend_from_slice(&encoded);
+        out.resize(table_start, 0);
         let mut table = [0u8; 32];
-        for (off, val) in [
+        for (off, value) in [
             (0, address),
-            (4, raw.len() as u32 + 4),
+            (4, stored_size as u32),
             (16, raw.len() as u32),
             (20, address + 0x4000_0000),
         ] {
-            table[off..off + 4].copy_from_slice(&val.to_le_bytes());
+            table[off..off + 4].copy_from_slice(&value.to_le_bytes());
         }
         out.extend_from_slice(&table);
-        out.resize(1024, 0); // Complete the first data sector for the parser.
+        out.resize(sector_round(out.len(), 512).unwrap(), 0);
         out
     }
 
@@ -396,6 +596,73 @@ mod tests {
         assert_eq!(image.header.sections, 1);
         assert_eq!(image.sections[0].physical_address, 0x8100_0000);
         assert_eq!(decode_section(&bytes, &image.sections[0]).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn literal_encoder_round_trips_multiple_u16_blocks() {
+        let raw = vec![0x5a; usize::from(u16::MAX) + 17];
+        let encoded = encode_literal_section(&raw).unwrap();
+        assert_eq!(encoded[0], 0x0f);
+        assert_eq!(u16::from_le_bytes([encoded[2], encoded[3]]), u16::MAX);
+        assert_eq!(encoded[usize::from(u16::MAX) + 4], 0x0f);
+
+        // Use a synthetic WBI fixture with the multi-block section size.
+        let original = fixture(&raw, 0x8100_0000);
+        let candidate = replace_section_contents(&original, 0, &raw).unwrap();
+        let image = parse(&candidate).unwrap();
+        assert_eq!(decode_section(&candidate, &image.sections[0]).unwrap(), raw);
+        assert_eq!(image.sections[0].expanded_size, usize::from(u16::MAX) + 17);
+    }
+
+    #[test]
+    fn flip_section_byte_rebuilds_a_parser_accepted_host_candidate() {
+        let original = fixture(b"hello", 0x8100_0000);
+        let before = parse(&original).unwrap();
+        let patched = flip_section_byte(&original, 0, 1, 0x20).unwrap();
+        let after = parse(&patched).unwrap();
+
+        assert_eq!(after.header.sections, before.header.sections);
+        assert_eq!(after.header.resume_vector, before.header.resume_vector);
+        assert_eq!(after.header.version, before.header.version);
+        assert_eq!(after.header.expanded_size, before.header.expanded_size);
+        assert_eq!(after.sections[0].physical_address, before.sections[0].physical_address);
+        assert_eq!(after.sections[0].virtual_address, before.sections[0].virtual_address);
+        assert_eq!(after.sections[0].expanded_size, before.sections[0].expanded_size);
+        assert_eq!(decode_section(&patched, &after.sections[0]).unwrap(), b"hEllo");
+        assert_eq!(patched.len() % after.header.sector_size as usize, 0);
+        assert_eq!(after.sections[0].compressed_size, 512);
+    }
+
+    #[test]
+    fn replace_section_rejects_length_mask_and_index_errors() {
+        let original = fixture(b"hello", 0x8100_0000);
+        assert!(replace_section_contents(&original, 0, b"short!").is_err());
+        assert!(flip_section_byte(&original, 0, 0, 0).is_err());
+        assert!(flip_section_byte(&original, 0, 99, 1).is_err());
+        assert!(flip_section_byte(&original, 1, 0, 1).is_err());
+    }
+
+    #[test]
+    fn replace_section_recomputes_payload_checksum_only_when_enabled() {
+        let mut original = fixture(b"abcdefgh", 0x8100_0000);
+        original[8..12].copy_from_slice(&13u32.to_le_bytes()); // COMPRESS | CKSUM | LZ77
+        let patched = flip_section_byte(&original, 0, 0, 1).unwrap();
+        let image = parse(&patched).unwrap();
+        let section = image.sections[0];
+        let table = image.data_offset + image.header.compressed_size as usize;
+        let checksum = u32::from_le_bytes(patched[table + 8..table + 12].try_into().unwrap());
+        assert_eq!(checksum, wbi_xor_checksum(b"\x60bcdefgh"));
+        let metadata = u32::from_le_bytes(patched[table + 28..table + 32].try_into().unwrap());
+        let words = [
+            section.physical_address,
+            section.compressed_size as u32,
+            checksum,
+            0,
+            section.expanded_size as u32,
+            section.virtual_address,
+            section.padding,
+        ];
+        assert_eq!(metadata, words.iter().fold(0x0f0f_0f0f, |sum, word| sum ^ word));
     }
 
     #[test]
