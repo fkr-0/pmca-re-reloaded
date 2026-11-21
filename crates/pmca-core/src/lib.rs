@@ -38,6 +38,7 @@ pub mod backup;
 pub mod camset;
 pub mod fdat;
 pub mod firmware;
+pub mod hx50v_menu;
 pub mod keystore;
 pub mod photo;
 pub mod sha1;
